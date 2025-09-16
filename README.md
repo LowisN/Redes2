@@ -1,8 +1,8 @@
 Para compilar servidor:
-gcc -Wall -Wextra -std=c99 -pthread \
-    -I/usr/include/mariadb -I/usr/include/mariadb/mysql \
-    -o servidor server.c \
-    -L/usr/lib/x86_64-linux-gnu/ -lmariadb
+gcc server.c -o server -lpthread -lmysqlclient
 
 Para cliente:
-gcc -Wall -Wextra -std=c99 -pthread -o cliente cliente.c
+gcc cliente.c -o cliente
+
+
+Use MYSQL, pienso mudar la BD a mariaDB posteriormente. 
