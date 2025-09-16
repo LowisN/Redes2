@@ -1,5 +1,5 @@
 /* Garcia Mayorga Rodrigo
-   Parlante Gualo Luis Eduardo
+   Patlan Gualo Luis Eduardo
    Servidor
    6CV3
    Servidor concurrente con autenticación, menú, envío de archivos y chat con MySQL
@@ -692,4 +692,5 @@ cleanup:
            ntohs(cli->addr.sin_port));
     free(cli);
     return NULL;
+
 }
