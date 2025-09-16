@@ -15,8 +15,6 @@
 #define PORT 8080
 #define BUFFER_SIZE 1024
 
-
-
 /* Funciones auxiliares de comunicación */
 int send_all(int sockfd, const void *buf, size_t len);
 int send_line(int sockfd, const char *text);
@@ -74,8 +72,6 @@ int main() {
     printf("Conexión cerrada.\n");
     return 0;
 }
-
-
 
 /* 
  * Enviar todos los bytes de un buffer
@@ -236,7 +232,17 @@ void chat_cliente(int sockfd, char *line, size_t len) {
         printf("%s\n", line);
         return;
     }
-    printf("Entrando en chat. Escribe 'exit' para volver al menú.\n");
+    
+    // Mostrar comandos especiales recibidos del servidor
+    printf("Entrando en chat. Comandos disponibles:\n");
+    while (1) {
+        if (recv_line(sockfd, line, len) <= 0) { printf("Servidor desconectado.\n"); return; }
+        if (strcmp(line, "Escribe tu mensaje:") == 0) {
+            printf("%s\n", line);
+            break;
+        }
+        printf("%s\n", line);
+    }
 
     while (1) {
         fd_set rset;

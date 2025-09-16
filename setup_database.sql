@@ -23,3 +23,28 @@ INSERT INTO usuarios (username, password) VALUES
 
 -- Mostrar los usuarios creados
 SELECT id, username, fecha_creacion FROM usuarios;
+
+
+
+-- Crear tabla de usuarios
+CREATE TABLE IF NOT EXISTS usuarios (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    username VARCHAR(50) NOT NULL UNIQUE,
+    password VARCHAR(100) NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Crear tabla de mensajes
+CREATE TABLE IF NOT EXISTS mensajes (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    username VARCHAR(50) NOT NULL,
+    mensaje TEXT NOT NULL,
+    timestamp DATETIME NOT NULL,
+    editado BOOLEAN DEFAULT FALSE,
+    timestamp_edicion DATETIME NULL,
+    FOREIGN KEY (username) REFERENCES usuarios(username)
+);
+
+-- Crear usuario para la aplicación
+CREATE USER IF NOT EXISTS 'practica3_user'@'localhost' IDENTIFIED BY 'tupassword';
+GR
