@@ -116,3 +116,16 @@ CREATE TABLE key_value_store (
     es_binario TINYINT(1) DEFAULT 0,
     timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
+
+
+ALTER TABLE key_value_store ADD COLUMN contador_accesos INT DEFAULT 0;
+
+CREATE TABLE IF NOT EXISTS auditoria (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    usuario VARCHAR(100),
+    operacion VARCHAR(50),
+    clave VARCHAR(255),
+    tiempo_respuesta_ms INT,
+    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
