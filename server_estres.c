@@ -3,6 +3,7 @@
    Servidor
    6CV3
    Servidor concurrente con autenticación, menú, envío de archivos y chat con MySQL
+   CON EXTENSIÓN PARA LECTURA CONCURRENTE
 */
 
 #include <stdio.h>
@@ -13,7 +14,7 @@
 #include <pthread.h>
 #include <errno.h>
 #include <sys/select.h>
-#include <mysql/mysql.h>  // Cambiado de mariadb/mysql.h a mysql/mysql.h
+#include <mysql/mysql.h>
 
 #define PORT 8080
 #define BUFFER_SIZE 1024
@@ -22,20 +23,16 @@
 // Configuración de la base de datos MySQL
 #define DB_HOST "localhost"
 #define DB_USER "practica3_user"
-#define DB_PASSWORD "020718"
+#define DB_PASSWORD "password123"
 #define DB_NAME "practica3"
 
-// Estructura para compartir información entre hilos
-typedef struct {
-    int sockfd;
-    struct sockaddr_in addr;
-    char username[BUFFER_SIZE];
-    int in_chat;
-} client_info_t;
+pthread_mutex_t stdin_mutex = PTHREAD_MUTEX_INITIALIZER;
+pthread_mutex_t db_query_mutex = PTHREAD_MUTEX_INITIALIZER;
 
-// Variables globales para manejar clientes en chat
-client_info_t *chat_clients[MAX_CLIENTS] = {NULL};
-pthread_mutex_t chat_clients_mutex = PTHREAD_MUTEX_INITIALIZER;
+// Nuevos mutexes para control de lectores-escritores
+pthread_mutex_t read_count_mutex = PTHREAD_MUTEX_INITIALIZER;
+pthread_mutex_t write_mutex = PTHREAD_MUTEX_INITIALIZER;
+int read_count = 0;
 
 int send_all(int sockfd, const void *buf, size_t len);
 int send_line(int sockfd, const char *text);
@@ -54,10 +51,10 @@ int modify_message(int message_id, const char *username, const char *new_message
 int get_message_history(int sockfd, const char *username);
 int execute_server_query(const char *query);
 
-// Funciones para manejar chat
-void add_client_to_chat(client_info_t *cli);
-void remove_client_from_chat(int sockfd);
-void send_server_message(const char *message);
+// Nuevas funciones para lectura concurrente
+int concurrent_db_read(const char *query, void (*process_result)(MYSQL_RES*));
+int concurrent_db_write(const char *query);
+int query_user_info(int sockfd, const char *username);
 
 /**FUNCIÓN PRINCIPAL*/
 int main() {
@@ -90,6 +87,7 @@ int main() {
     printf("Servidor esperando conexiones en el puerto %d...\n", PORT);
     printf("Autenticación habilitada con MySQL\n");
     printf("Base de datos: %s\n", DB_NAME);
+    printf("Lectura concurrente habilitada\n");
     
     // Crear hilo para interfaz de consultas de base de datos del servidor
     if (pthread_create(&db_tid, NULL, server_db_interface, NULL) != 0) {
@@ -98,21 +96,21 @@ int main() {
         pthread_detach(db_tid);
         printf("Interfaz de consultas de base de datos del servidor iniciada.\n");
         printf("Escribe 'query' seguido de una consulta SQL para ejecutarla en el servidor.\n");
-        printf("Escribe 'msg <mensaje>' para enviar un mensaje a todos los clientes en chat.\n");
         printf("Ejemplo: query SELECT * FROM usuarios;\n");
-        printf("Ejemplo: msg Hola a todos desde el servidor!\n");
     }
 
     while (1) {
+        typedef struct {
+            int sockfd;
+            struct sockaddr_in addr;
+        } client_info_t;
+
         client_info_t *cli = malloc(sizeof(client_info_t));
         if (!cli) { perror("malloc"); continue; }
 
         socklen_t len = sizeof(cli->addr);
         cli->sockfd = accept(server_fd, (struct sockaddr*)&cli->addr, &len);
         if (cli->sockfd < 0) { perror("accept"); free(cli); continue; }
-        
-        cli->in_chat = 0;
-        cli->username[0] = '\0';
 
         if (pthread_create(&tid, NULL, handle_client, cli) != 0) {
             perror("pthread_create");
@@ -210,6 +208,81 @@ void close_db_connection(MYSQL *conn) {
     }
 }
 
+/* Implementación de funciones de lectura concurrente */
+int concurrent_db_read(const char *query, void (*process_result)(MYSQL_RES*)) {
+    pthread_mutex_lock(&read_count_mutex);
+    read_count++;
+    if (read_count == 1) {
+        pthread_mutex_lock(&write_mutex);
+    }
+    pthread_mutex_unlock(&read_count_mutex);
+    
+    MYSQL *conn = init_db_connection();
+    if (conn == NULL) {
+        pthread_mutex_lock(&read_count_mutex);
+        read_count--;
+        if (read_count == 0) {
+            pthread_mutex_unlock(&write_mutex);
+        }
+        pthread_mutex_unlock(&read_count_mutex);
+        return -1;
+    }
+    
+    if (mysql_query(conn, query)) {
+        fprintf(stderr, "Query failed: %s\n", mysql_error(conn));
+        close_db_connection(conn);
+        
+        pthread_mutex_lock(&read_count_mutex);
+        read_count--;
+        if (read_count == 0) {
+            pthread_mutex_unlock(&write_mutex);
+        }
+        pthread_mutex_unlock(&read_count_mutex);
+        return -1;
+    }
+    
+    MYSQL_RES *result = mysql_store_result(conn);
+    if (result != NULL) {
+        if (process_result != NULL) {
+            process_result(result);
+        }
+        mysql_free_result(result);
+    }
+    
+    close_db_connection(conn);
+    
+    pthread_mutex_lock(&read_count_mutex);
+    read_count--;
+    if (read_count == 0) {
+        pthread_mutex_unlock(&write_mutex);
+    }
+    pthread_mutex_unlock(&read_count_mutex);
+    
+    return 0;
+}
+
+int concurrent_db_write(const char *query) {
+    pthread_mutex_lock(&write_mutex);
+    
+    MYSQL *conn = init_db_connection();
+    if (conn == NULL) {
+        pthread_mutex_unlock(&write_mutex);
+        return -1;
+    }
+    
+    if (mysql_query(conn, query)) {
+        fprintf(stderr, "Query failed: %s\n", mysql_error(conn));
+        close_db_connection(conn);
+        pthread_mutex_unlock(&write_mutex);
+        return -1;
+    }
+    
+    close_db_connection(conn);
+    pthread_mutex_unlock(&write_mutex);
+    
+    return mysql_affected_rows(conn);
+}
+
 /* Autenticar usuario contra la base de datos */
 int authenticate_user(const char *username, const char *password) {
     MYSQL *conn = init_db_connection();
@@ -222,33 +295,26 @@ int authenticate_user(const char *username, const char *password) {
     char escaped_password[100];
     mysql_real_escape_string(conn, escaped_username, username, strlen(username));
     mysql_real_escape_string(conn, escaped_password, password, strlen(password));
+    close_db_connection(conn);
 
     char query[512];
     snprintf(query, sizeof(query),
              "SELECT COUNT(*) FROM usuarios WHERE username='%s' AND password='%s'",
              escaped_username, escaped_password);
 
-    if (mysql_query(conn, query)) {
-        fprintf(stderr, "Query failed: %s\n", mysql_error(conn));
-        close_db_connection(conn);
-        return -1;
-    }
-
-    MYSQL_RES *result = mysql_store_result(conn);
-    if (result == NULL) {
-        fprintf(stderr, "mysql_store_result() failed: %s\n", mysql_error(conn));
-        close_db_connection(conn);
-        return -1;
-    }
-
-    MYSQL_ROW row = mysql_fetch_row(result);
+    // Usar lectura concurrente
     int authenticated = 0;
-    if (row != NULL && atoi(row[0]) > 0) {
-        authenticated = 1;
+    void process_result(MYSQL_RES *result) {
+        MYSQL_ROW row = mysql_fetch_row(result);
+        if (row != NULL && atoi(row[0]) > 0) {
+            authenticated = 1;
+        }
+    }
+    
+    if (concurrent_db_read(query, process_result) < 0) {
+        return -1;
     }
 
-    mysql_free_result(result);
-    close_db_connection(conn);
     return authenticated;
 }
 
@@ -261,24 +327,17 @@ int store_message(const char *username, const char *message) {
 
     // Escapar los datos para prevenir SQL injection
     char escaped_username[100];
-    char escaped_message[2048];
+    char escaped_message[2048];  // Buffer aumentado para mensajes largos
     mysql_real_escape_string(conn, escaped_username, username, strlen(username));
     mysql_real_escape_string(conn, escaped_message, message, strlen(message));
+    close_db_connection(conn);
 
-    char query[4096];
+    char query[4096];  // Buffer de consulta más grande
     snprintf(query, sizeof(query),
              "INSERT INTO mensajes (username, mensaje, timestamp) VALUES ('%s', '%s', NOW())",
              escaped_username, escaped_message);
 
-    int success = 0;
-    if (mysql_query(conn, query)) {
-        fprintf(stderr, "Query failed: %s\n", mysql_error(conn));
-    } else {
-        success = (mysql_affected_rows(conn) > 0);
-    }
-
-    close_db_connection(conn);
-    return success;
+    return concurrent_db_write(query) > 0;
 }
 
 /* Obtener el último ID de mensaje insertado */
@@ -290,33 +349,25 @@ int get_last_message_id(const char *username) {
 
     char escaped_username[100];
     mysql_real_escape_string(conn, escaped_username, username, strlen(username));
+    close_db_connection(conn);
 
     char query[512];
     snprintf(query, sizeof(query),
              "SELECT id FROM mensajes WHERE username='%s' ORDER BY id DESC LIMIT 1",
              escaped_username);
 
-    if (mysql_query(conn, query)) {
-        fprintf(stderr, "Query failed: %s\n", mysql_error(conn));
-        close_db_connection(conn);
-        return -1;
-    }
-
-    MYSQL_RES *result = mysql_store_result(conn);
-    if (result == NULL) {
-        fprintf(stderr, "mysql_store_result() failed: %s\n", mysql_error(conn));
-        close_db_connection(conn);
-        return -1;
-    }
-
     int message_id = -1;
-    MYSQL_ROW row = mysql_fetch_row(result);
-    if (row != NULL) {
-        message_id = atoi(row[0]);
+    void process_result(MYSQL_RES *result) {
+        MYSQL_ROW row = mysql_fetch_row(result);
+        if (row != NULL) {
+            message_id = atoi(row[0]);
+        }
+    }
+    
+    if (concurrent_db_read(query, process_result) < 0) {
+        return -1;
     }
 
-    mysql_free_result(result);
-    close_db_connection(conn);
     return message_id;
 }
 
@@ -331,6 +382,7 @@ int modify_message(int message_id, const char *username, const char *new_message
     char escaped_message[1024];
     mysql_real_escape_string(conn, escaped_username, username, strlen(username));
     mysql_real_escape_string(conn, escaped_message, new_message, strlen(new_message));
+    close_db_connection(conn);
 
     char query[2048];
     snprintf(query, sizeof(query),
@@ -338,14 +390,7 @@ int modify_message(int message_id, const char *username, const char *new_message
              "WHERE id=%d AND username='%s'",
              escaped_message, message_id, escaped_username);
 
-    if (mysql_query(conn, query)) {
-        fprintf(stderr, "Query failed: %s\n", mysql_error(conn));
-        close_db_connection(conn);
-        return -1;
-    }
-
-    close_db_connection(conn);
-    return mysql_affected_rows(conn);
+    return concurrent_db_write(query);
 }
 
 /* Obtener historial de mensajes */
@@ -357,6 +402,7 @@ int get_message_history(int sockfd, const char *username) {
 
     char escaped_username[100];
     mysql_real_escape_string(conn, escaped_username, username, strlen(username));
+    close_db_connection(conn);
 
     char query[512];
     snprintf(query, sizeof(query),
@@ -364,49 +410,39 @@ int get_message_history(int sockfd, const char *username) {
              "WHERE username='%s' ORDER BY timestamp DESC LIMIT 10",
              escaped_username);
 
-    if (mysql_query(conn, query)) {
-        fprintf(stderr, "Query failed: %s\n", mysql_error(conn));
-        close_db_connection(conn);
-        return -1;
-    }
-
-    MYSQL_RES *result = mysql_store_result(conn);
-    if (result == NULL) {
-        fprintf(stderr, "mysql_store_result() failed: %s\n", mysql_error(conn));
-        close_db_connection(conn);
-        return -1;
-    }
-
-    send_line(sockfd, "=== HISTORIAL DE MENSAJES ===");
-    
-    MYSQL_ROW row;
-    while ((row = mysql_fetch_row(result))) {
-        char history_line[2048];
-        if (row[3] != NULL && atoi(row[3]) == 1) {
-            snprintf(history_line, sizeof(history_line), 
-                    "[ID: %s] (editado) %s - %s", row[0], row[1], row[2]);
-        } else {
-            snprintf(history_line, sizeof(history_line), 
-                    "[ID: %s] %s - %s", row[0], row[1], row[2]);
+    // Usar lectura concurrente
+    void process_result(MYSQL_RES *result) {
+        send_line(sockfd, "=== HISTORIAL DE MENSAJES ===");
+        
+        MYSQL_ROW row;
+        while ((row = mysql_fetch_row(result))) {
+            char history_line[2048];
+            if (row[3] != NULL && atoi(row[3]) == 1) {
+                snprintf(history_line, sizeof(history_line), 
+                        "[ID: %s] (editado) %s - %s", row[0], row[1], row[2]);
+            } else {
+                snprintf(history_line, sizeof(history_line), 
+                        "[ID: %s] %s - %s", row[0], row[1], row[2]);
+            }
+            send_line(sockfd, history_line);
         }
-        send_line(sockfd, history_line);
     }
-
-    mysql_free_result(result);
-    close_db_connection(conn);
-    return 0;
+    
+    return concurrent_db_read(query, process_result);
 }
 
 /* Ejecutar consulta desde el servidor */
 int execute_server_query(const char *query) {
+    // Para consultas del servidor, usamos el método tradicional
     MYSQL *conn = init_db_connection();
     if (conn == NULL) {
-        printf("Error: No se pudo conectar to the database\n");
+        printf("Error: No se pudo conectar a la base de datos\n");
         return -1;
     }
 
     printf("Ejecutando consulta: %s\n", query);
 
+    // Ejecutar la consulta
     if (mysql_query(conn, query)) {
         printf("Error en la consulta: %s\n", mysql_error(conn));
         close_db_connection(conn);
@@ -415,6 +451,7 @@ int execute_server_query(const char *query) {
 
     MYSQL_RES *result = mysql_store_result(conn);
     if (result == NULL) {
+        // Consulta que no devuelve resultados (INSERT, UPDATE, DELETE, etc.)
         if (mysql_field_count(conn) == 0) {
             int affected_rows = mysql_affected_rows(conn);
             printf("Consulta ejecutada. Filas afectadas: %d\n", affected_rows);
@@ -422,9 +459,11 @@ int execute_server_query(const char *query) {
             printf("Error: No se pudieron obtener los resultados\n");
         }
     } else {
+        // Consulta que devuelve resultados (SELECT, SHOW, etc.)
         int num_fields = mysql_num_fields(result);
         MYSQL_FIELD *fields = mysql_fetch_fields(result);
         
+        // Mostrar nombres de columnas
         printf("\n");
         for (int i = 0; i < num_fields; i++) {
             printf("%-20s", fields[i].name);
@@ -434,6 +473,7 @@ int execute_server_query(const char *query) {
         }
         printf("\n");
         
+        // Mostrar separador
         for (int i = 0; i < num_fields; i++) {
             for (int j = 0; j < 20; j++) printf("-");
             if (i < num_fields - 1) {
@@ -442,6 +482,7 @@ int execute_server_query(const char *query) {
         }
         printf("\n");
         
+        // Mostrar filas de resultados
         MYSQL_ROW row;
         while ((row = mysql_fetch_row(result))) {
             for (int i = 0; i < num_fields; i++) {
@@ -467,77 +508,75 @@ int execute_server_query(const char *query) {
     return 0;
 }
 
-/* Añadir cliente a la lista de chat */
-void add_client_to_chat(client_info_t *cli) {
-    pthread_mutex_lock(&chat_clients_mutex);
-    for (int i = 0; i < MAX_CLIENTS; i++) {
-        if (chat_clients[i] == NULL) {
-            chat_clients[i] = cli;
-            cli->in_chat = 1;
-            break;
-        }
-    }
-    pthread_mutex_unlock(&chat_clients_mutex);
-}
-
-/* Remover cliente de la lista de chat */
-void remove_client_from_chat(int sockfd) {
-    pthread_mutex_lock(&chat_clients_mutex);
-    for (int i = 0; i < MAX_CLIENTS; i++) {
-        if (chat_clients[i] != NULL && chat_clients[i]->sockfd == sockfd) {
-            chat_clients[i]->in_chat = 0;
-            chat_clients[i] = NULL;
-            break;
-        }
-    }
-    pthread_mutex_unlock(&chat_clients_mutex);
-}
-
-/* Enviar mensaje del servidor a todos los clientes */
-void send_server_message(const char *message) {
-    char formatted_message[BUFFER_SIZE * 2];
-    snprintf(formatted_message, sizeof(formatted_message), "[SERVIDOR]: %s", message);
-    
-    pthread_mutex_lock(&chat_clients_mutex);
-    for (int i = 0; i < MAX_CLIENTS; i++) {
-        if (chat_clients[i] != NULL && chat_clients[i]->in_chat) {
-            send_line(chat_clients[i]->sockfd, formatted_message);
-        }
-    }
-    pthread_mutex_unlock(&chat_clients_mutex);
-}
-
 /* Interfaz para consultas de base de datos desde el servidor */
 void *server_db_interface(void *arg) {
     char input[BUFFER_SIZE];
     
     while (1) {
+        // Leer entrada del servidor
         if (fgets(input, sizeof(input), stdin) == NULL) {
             continue;
         }
         
+        // Eliminar salto de línea
         input[strcspn(input, "\n")] = 0;
         
+        // Verificar si es un comando de consulta
         if (strncmp(input, "query ", 6) == 0) {
             char *query = input + 6;
+            
+            // Ejecutar la consulta
+            pthread_mutex_lock(&db_query_mutex);
             execute_server_query(query);
-        } else if (strncmp(input, "msg ", 4) == 0) {
-            char *message = input + 4;
-            send_server_message(message);
-            printf("Mensaje enviado a todos los clientes: %s\n", message);
+            pthread_mutex_unlock(&db_query_mutex);
         } else if (strcmp(input, "exit") == 0) {
             printf("Saliendo del servidor...\n");
             exit(0);
         } else if (strlen(input) > 0) {
-            printf("Comando no reconocido. Usa 'query' seguido de una consulta SQL o 'msg' seguido de un mensaje.\n");
+            printf("Comando no reconocido. Usa 'query' seguido de una consulta SQL.\n");
         }
     }
     
     return NULL;
 }
 
+/* Nueva función para consultar información de usuario */
+int query_user_info(int sockfd, const char *username) {
+    MYSQL *conn = init_db_connection();
+    if (conn == NULL) {
+        return -1;
+    }
+
+    char escaped_username[100];
+    mysql_real_escape_string(conn, escaped_username, username, strlen(username));
+    close_db_connection(conn);
+
+    char query[512];
+    snprintf(query, sizeof(query),
+             "SELECT username, fecha_creacion FROM usuarios WHERE username='%s'",
+             escaped_username);
+
+    void process_result(MYSQL_RES *result) {
+        MYSQL_ROW row = mysql_fetch_row(result);
+        if (row != NULL) {
+            char info[256];
+            snprintf(info, sizeof(info), "Usuario: %s, Fecha creación: %s", row[0], row[1]);
+            send_line(sockfd, info);
+        } else {
+            send_line(sockfd, "Usuario no encontrado");
+        }
+    }
+    
+    return concurrent_db_read(query, process_result);
+}
+
 /* Hilo que atiende a un cliente */
 void *handle_client(void *arg) {
+    typedef struct {
+        int sockfd;
+        struct sockaddr_in addr;
+    } client_info_t;
+
     client_info_t *cli = (client_info_t*)arg;
     char line[BUFFER_SIZE];
 
@@ -548,8 +587,9 @@ void *handle_client(void *arg) {
     // pedir username
     if (send_line(cli->sockfd, "Por favor ingrese su nombre de usuario:") < 0) goto cleanup;
     if (recv_line(cli->sockfd, line, sizeof(line)) <= 0) goto cleanup;
-    strncpy(cli->username, line, sizeof(cli->username)-1);
-    cli->username[sizeof(cli->username)-1] = '\0';
+    char username[BUFFER_SIZE];
+    strncpy(username, line, sizeof(username)-1);
+    username[sizeof(username)-1] = '\0';
 
     // pedir contraseña
     if (send_line(cli->sockfd, "Ingrese su contraseña:") < 0) goto cleanup;
@@ -559,7 +599,7 @@ void *handle_client(void *arg) {
     password[sizeof(password)-1] = '\0';
 
     // Autenticar con la base de datos
-    int auth_result = authenticate_user(cli->username, password);
+    int auth_result = authenticate_user(username, password);
     if (auth_result != 1) {
         if (auth_result == 0) {
             send_line(cli->sockfd, "Autenticación fallida. Usuario o contraseña incorrectos.");
@@ -572,13 +612,14 @@ void *handle_client(void *arg) {
     send_line(cli->sockfd, "Autenticación exitosa! Bienvenido.");
     printf("Cliente %s:%d autenticado correctamente como '%s'\n",
            inet_ntoa(cli->addr.sin_addr),
-           ntohs(cli->addr.sin_port), cli->username);
+           ntohs(cli->addr.sin_port), username);
 
     // loop del menú
     while (1) {
         send_line(cli->sockfd, "¿Qué deseas hacer?");
         send_line(cli->sockfd, "1. Descargar archivo");
         send_line(cli->sockfd, "2. Iniciar chat");
+        send_line(cli->sockfd, "3. Consultar información de usuario"); // NUEVA OPCIÓN
         send_line(cli->sockfd, "0. Cerrar conexión");
         send_line(cli->sockfd, "Elige opción:");
 
@@ -607,7 +648,7 @@ void *handle_client(void *arg) {
                 char buf[BUFFER_SIZE];
                 size_t tosend;
                 while ((tosend = fread(buf, 1, sizeof(buf), f)) > 0) {
-                    if (send_all(cli->sockfd, buf, tosend) < 极 break;
+                    if (send_all(cli->sockfd, buf, tosend) < 0) break;
                 }
                 fclose(f);
                 send_line(cli->sockfd, "FILE_END");
@@ -619,40 +660,28 @@ void *handle_client(void *arg) {
             }
         } else if (strcmp(line, "2") == 0) {
             if (send_line(cli->sockfd, "CHAT_START") < 0) break;
-            printf("Chat iniciado con %s:%极 (usuario: %s)\n",
+            printf("Chat iniciado con %s:%d (escribe 'exit' para terminar chat)\n",
                    inet_ntoa(cli->addr.sin_addr),
-                   ntohs(cli->addr.sin_port), cli->username);
-            
-            // Añadir cliente a la lista de chat
-            add_client_to_chat(cli);
-            
-            // Enviar mensaje de bienvenida al chat
-            send_line(cli->sockfd, "Bienvenido al chat! Escribe '/help' para ver comandos disponibles.");
-            send_line(cli->sockfd, "NOTA: Los mensajes solo son visibles para el servidor.");
+                   ntohs(cli->addr.sin_port));
             
             // Enviar opciones de chat mejorado
             send_line(cli->sockfd, "Comandos especiales:");
-            send_line(cl极->sockfd, "/help - Mostrar ayuda");
             send_line(cli->sockfd, "/history - Ver historial de mensajes");
             send_line(cli->sockfd, "/edit <id> <nuevo mensaje> - Editar mensaje");
-            send_line(cli->sockfd, "/exit - Salir del chat");
             send_line(cli->sockfd, "Escribe tu mensaje:");
 
             while (1) {
                 fd_set rset;
                 FD_ZERO(&rset);
                 FD_SET(cli->sockfd, &rset);
-                int maxfd = cli->sockfd;
+                FD_SET(STDIN_FILENO, &rset);
+                int maxfd = (cli->sockfd > STDIN_FILENO) ? cli->sockfd : STDIN_FILENO;
 
-                struct timeval tv;
-                tv.tv_sec = 1;
-                tv.tv_usec = 0;
-
-                int sel = select(maxfd + 1, &r极t, NULL, NULL, &tv);
+                int sel = select(maxfd + 1, &rset, NULL, NULL, NULL);
                 if (sel < 0) {
                     if (errno == EINTR) continue;
                     perror("select chat servidor");
-                    break;
+                    goto cleanup;
                 }
 
                 if (FD_ISSET(cli->sockfd, &rset)) {
@@ -661,21 +690,22 @@ void *handle_client(void *arg) {
                         printf("Cliente %s:%d desconectó durante chat\n",
                                inet_ntoa(cli->addr.sin_addr),
                                ntohs(cli->addr.sin_port));
-                        break;
+                        goto cleanup;
                     }
                     
                     // Procesar comandos especiales
                     if (strncmp(line, "/history", 8) == 0) {
-                        get_message_history(cli->sockfd, cli->username);
+                        get_message_history(cli->sockfd, username);
                     }
                     else if (strncmp(line, "/edit", 5) == 0) {
+                        // Parsear comando: /edit <id> <nuevo mensaje>
                         char *token = strtok(line + 6, " ");
                         if (token != NULL) {
                             int message_id = atoi(token);
                             char *new_message = strtok(NULL, "");
                             if (new_message != NULL) {
-                                int result = modify_message(message_id, cli->username, new_message);
-                                if (result > 0) {
+                                int result = modify_message(message_id, username, new_message);
+                                if (result <= 0) {
                                     send_line(cli->sockfd, "Mensaje modificado correctamente");
                                 } else {
                                     send_line(cli->sockfd, "Error: No se pudo modificar el mensaje");
@@ -684,19 +714,8 @@ void *handle_client(void *arg) {
                                 send_line(cli->sockfd, "Uso: /edit <id> <nuevo mensaje>");
                             }
                         } else {
-                            send_line(cli->sockfd, "U极: /edit <id> <nuevo mensaje>");
+                            send_line(cli->sockfd, "Uso: /edit <id> <nuevo mensaje>");
                         }
-                    }
-                    else if (strcmp(line, "/exit") == 0) {
-                        send_line(cli->sockfd, "Saliendo del chat...");
-                        break;
-                    }
-                    else if (strcmp(line, "/help") == 0) {
-                        send_line(cli->sockfd, "Comandos disponibles:");
-                        send_line(cli->极ockfd, "/help - Mostrar esta ayuda");
-                        send_line(cli->sockfd, "/history - Ver historial de mensajes");
-                        send_line(cli->sockfd, "/edit <id> <nuevo mensaje> - Editar mensaje");
-                        send_line(cli->sockfd, "/exit - Salir del chat");
                     }
                     else if (strcmp(line, "exit") == 0) {
                         send_line(cli->sockfd, "exit");
@@ -704,29 +723,43 @@ void *handle_client(void *arg) {
                     }
                     else {
                         // Almacenar mensaje normal en la base de datos
-                        if (store_message(cli->username, line) == 1) {
-                            printf("Mensaje de %s (%s:%d): %s (almacenado en BD)\n",
-                                   cli->username,
-                                   inet_ntoa(cli->addr.sin_addr),
-                                   ntohs(cli->addr.sin_port), line);
-                            // Confirmar al cliente que el mensaje fue recibido
-                            send_line(cli->sockfd, "Mensaje recibido por el servidor.");
-                        } else {
-                            printf("Error al almacenar mensaje de %s (%s:%d): %s\n",
-                                   cli->username,
-                                   inet_ntoa(cli->addr.sin_addr),
-                                   ntohs(cli->addr.sin_port), line);
-                            send_line(cli->sockfd, "Error: No se pudo almacenar el mensaje");
-                        }
+                       if (store_message(username, line) == 1) {
+    printf("Cliente %s:%d: %s (almacenado en BD)\n",
+           inet_ntoa(cli->addr.sin_addr),
+           ntohs(cli->addr.sin_port), line);
+} else {
+    printf("Cliente %s:%d: %s (error al almacenar)\n",
+           inet_ntoa(cli->addr.sin_addr),
+           ntohs(cli->addr.sin_port), line);
+}
+                    }
+                }
+
+                if (FD_ISSET(STDIN_FILENO, &rset)) {
+                    pthread_mutex_lock(&stdin_mutex);
+                    if (fgets(line, sizeof(line), stdin) == NULL) {
+                        pthread_mutex_unlock(&stdin_mutex);
+                        send_line(cli->sockfd, "exit");
+                        break;
+                    }
+                    line[strcspn(line, "\r\n")] = '\0';
+                    pthread_mutex_unlock(&stdin_mutex);
+
+                    if (strcmp(line, "exit") == 0) {
+                        send_line(cli->sockfd, "exit");
+                        break;
+                    } else {
+                        send_line(cli->sockfd, line);
                     }
                 }
             }
-            
-            // Remover cliente de la lista de chat
-            remove_client_from_chat(cli->sockfd);
             printf("Chat finalizado con %s:%d\n",
                    inet_ntoa(cli->addr.sin_addr),
                    ntohs(cli->addr.sin_port));
+        } else if (strcmp(line, "3") == 0) { // NUEVA OPCIÓN
+            send_line(cli->sockfd, "Ingrese el nombre de usuario a consultar:");
+            if (recv_line(cli->sockfd, line, sizeof(line)) <= 0) break;
+            query_user_info(cli->sockfd, line);
         } else if (strcmp(line, "0") == 0) {
             send_line(cli->sockfd, "Cerrando conexión. Hasta luego.");
             break;
@@ -736,14 +769,10 @@ void *handle_client(void *arg) {
     }
 
 cleanup:
-    // Asegurarse de remover el cliente de la lista de chat si está allí
-    remove_client_from_chat(cli->sockfd);
-    
     close(cli->sockfd);
     printf("Conexión cerrada con %s:%d\n",
            inet_ntoa(cli->addr.sin_addr),
            ntohs(cli->addr.sin_port));
     free(cli);
     return NULL;
-
 }

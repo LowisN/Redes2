@@ -1,0 +1,6 @@
+
+gcc server_6.c -o server -lpthread -lmariadb -lssl -lcrypto
+gcc cliente.c -o cliente -lssl -lcrypto
+sudo apt-get install libssl-dev
+GRANT ALL PRIVILEGES ON practica3.* TO 'practica3_user'@'localhost';
+FLUSH PRIVILEGES;

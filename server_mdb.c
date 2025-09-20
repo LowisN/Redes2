@@ -1,8 +1,11 @@
 /* Garcia Mayorga Rodrigo
-   Patlan Gualo Luis Eduardo
+   Parlante Gualo Luis Eduardo
    Servidor
    6CV3
-   Servidor concurrente con autenticación, menú, envío de archivos y chat con MySQL
+   Servidor concurrente con autenticación, menú, envío de archivos y chat con MariaDB
+gcc server_mdb.c -o server -lpthread -lmariadb
+instalar la libreria sudo apt-get install libmariadb-dev
+
 */
 
 #include <stdio.h>
@@ -13,13 +16,13 @@
 #include <pthread.h>
 #include <errno.h>
 #include <sys/select.h>
-#include <mysql/mysql.h>  // Cambiado de mariadb/mysql.h a mysql/mysql.h
+#include <mariadb/mysql.h>
 
 #define PORT 8080
 #define BUFFER_SIZE 1024
 #define MAX_CLIENTS 60
 
-// Configuración de la base de datos MySQL
+// Configuración de la base de datos MariaDB
 #define DB_HOST "localhost"
 #define DB_USER "practica3_user"
 #define DB_PASSWORD "020718"
@@ -88,7 +91,7 @@ int main() {
     }
 
     printf("Servidor esperando conexiones en el puerto %d...\n", PORT);
-    printf("Autenticación habilitada con MySQL\n");
+    printf("Autenticación habilitada con MariaDB\n");
     printf("Base de datos: %s\n", DB_NAME);
     
     // Crear hilo para interfaz de consultas de base de datos del servidor
@@ -186,7 +189,7 @@ ssize_t read_n_bytes(int sockfd, void *buf, size_t n) {
     return (ssize_t)(n - nleft);
 }
 
-/* Inicializar conexión a la base de datos MySQL */
+/* Inicializar conexión a la base de datos MariaDB */
 MYSQL* init_db_connection(void) {
     MYSQL *conn = mysql_init(NULL);
     if (conn == NULL) {
@@ -194,12 +197,14 @@ MYSQL* init_db_connection(void) {
         return NULL;
     }
 
-    if (mysql_real_connect(conn, DB_HOST, DB_USER, DB_PASSWORD, DB_NAME, 0, NULL, 0) == NULL) {
+    if (mysql_real_connect(conn, DB_HOST, DB_USER, DB_PASSWORD, DB_NAME, 0, NULL, CLIENT_FOUND_ROWS) == NULL) {
         fprintf(stderr, "mysql_real_connect() failed: %s\n", mysql_error(conn));
         mysql_close(conn);
         return NULL;
     }
 
+    mysql_set_character_set(conn, "utf8mb4");
+    
     return conn;
 }
 
@@ -607,7 +612,7 @@ void *handle_client(void *arg) {
                 char buf[BUFFER_SIZE];
                 size_t tosend;
                 while ((tosend = fread(buf, 1, sizeof(buf), f)) > 0) {
-                    if (send_all(cli->sockfd, buf, tosend) < 极 break;
+                    if (send_all(cli->sockfd, buf, tosend) < 0) break;
                 }
                 fclose(f);
                 send_line(cli->sockfd, "FILE_END");
@@ -619,7 +624,7 @@ void *handle_client(void *arg) {
             }
         } else if (strcmp(line, "2") == 0) {
             if (send_line(cli->sockfd, "CHAT_START") < 0) break;
-            printf("Chat iniciado con %s:%极 (usuario: %s)\n",
+            printf("Chat iniciado con %s:%d (usuario: %s)\n",
                    inet_ntoa(cli->addr.sin_addr),
                    ntohs(cli->addr.sin_port), cli->username);
             
@@ -632,7 +637,7 @@ void *handle_client(void *arg) {
             
             // Enviar opciones de chat mejorado
             send_line(cli->sockfd, "Comandos especiales:");
-            send_line(cl极->sockfd, "/help - Mostrar ayuda");
+            send_line(cli->sockfd, "/help - Mostrar ayuda");
             send_line(cli->sockfd, "/history - Ver historial de mensajes");
             send_line(cli->sockfd, "/edit <id> <nuevo mensaje> - Editar mensaje");
             send_line(cli->sockfd, "/exit - Salir del chat");
@@ -648,7 +653,7 @@ void *handle_client(void *arg) {
                 tv.tv_sec = 1;
                 tv.tv_usec = 0;
 
-                int sel = select(maxfd + 1, &r极t, NULL, NULL, &tv);
+                int sel = select(maxfd + 1, &rset, NULL, NULL, &tv);
                 if (sel < 0) {
                     if (errno == EINTR) continue;
                     perror("select chat servidor");
@@ -684,7 +689,7 @@ void *handle_client(void *arg) {
                                 send_line(cli->sockfd, "Uso: /edit <id> <nuevo mensaje>");
                             }
                         } else {
-                            send_line(cli->sockfd, "U极: /edit <id> <nuevo mensaje>");
+                            send_line(cli->sockfd, "Uso: /edit <id> <nuevo mensaje>");
                         }
                     }
                     else if (strcmp(line, "/exit") == 0) {
@@ -693,7 +698,7 @@ void *handle_client(void *arg) {
                     }
                     else if (strcmp(line, "/help") == 0) {
                         send_line(cli->sockfd, "Comandos disponibles:");
-                        send_line(cli->极ockfd, "/help - Mostrar esta ayuda");
+                        send_line(cli->sockfd, "/help - Mostrar esta ayuda");
                         send_line(cli->sockfd, "/history - Ver historial de mensajes");
                         send_line(cli->sockfd, "/edit <id> <nuevo mensaje> - Editar mensaje");
                         send_line(cli->sockfd, "/exit - Salir del chat");
@@ -745,5 +750,4 @@ cleanup:
            ntohs(cli->addr.sin_port));
     free(cli);
     return NULL;
-
 }
